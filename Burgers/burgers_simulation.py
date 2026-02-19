@@ -1,70 +1,102 @@
 #!/usr/bin/env python3
-"""Inviscid Burgers equation simulation with periodic boundary conditions.
+"""1D inviscid Burgers equation simulation (paper replication).
 
-Equation: u_t + (u^2/2)_x = 0
-Spatial discretization: Godunov (exact Riemann for Burgers)
-Time stepping: forward Euler with CFL control
+Governing equation (periodic on [-3, 3]):
+    u_t + u u_x = 0
+    u(t, x=3) = u(t, x=-3)
+
+Initial condition (parameterized):
+    u(0, x | a, w) = a * exp(-x^2 / (2 w^2))
+
+Defaults follow the paper:
+    dx = 6e-3, dt = 1e-3, t_end = 1.0
+    a in [0.7, 0.9], w in [0.9, 1.1]
+
+Numerics:
+    - Backward Euler in time (implicit)
+    - Central finite difference on the conservative flux derivative
+      f(u) = 0.5 * u^2
+    - Nonlinear solve via Picard (fixed-point) iteration
+
+Dataset generation:
+    --dataset-dir writes one .npz per (a, w) with full time evolution.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Tuple
+from typing import Iterable, Tuple
 
 import numpy as np
 
 
 @dataclass
 class SimConfig:
-    n: int = 200
-    length: float = 2.0 * np.pi
+    x_min: float = -3.0
+    x_max: float = 3.0
+    dx: float = 6.0e-3
+    dt: float = 1.0e-3
     t_end: float = 1.0
-    cfl: float = 0.5
-    ic: str = "gaussian"
-    amp: float = 1.0
+    a: float = 0.8
+    w: float = 1.0
+    include_endpoint: bool = True
+    max_iter: int = 50
+    tol: float = 1.0e-10
     snapshot_interval: float = 0.0
     snapshot_dir: str = ""
 
 
-def initial_condition(x: np.ndarray, ic: str, amp: float) -> np.ndarray:
-    if ic == "sine":
-        return amp * np.sin(x)
-    if ic == "square":
-        return amp * np.where(np.sin(x) >= 0.0, 1.0, -1.0)
-    if ic == "gaussian":
-        return amp * np.exp(-((x - x.mean()) ** 2) / 0.1)
-    raise ValueError(f"Unknown initial condition: {ic}")
+def make_grid(cfg: SimConfig) -> np.ndarray:
+    length = cfg.x_max - cfg.x_min
+    nx_float = length / cfg.dx
+    nx = int(round(nx_float))
+    if not np.isclose(nx_float, nx, rtol=0.0, atol=1.0e-12):
+        raise ValueError("Domain length must be an integer multiple of dx")
+    return np.linspace(cfg.x_min, cfg.x_max, nx, endpoint=False)
 
 
-def godunov_flux(u_left: np.ndarray, u_right: np.ndarray) -> np.ndarray:
-    """Exact Godunov flux for inviscid Burgers equation."""
-    f_left = 0.5 * u_left * u_left
-    f_right = 0.5 * u_right * u_right
-
-    rare = u_left <= u_right
-
-    # Rarefaction fan
-    flux_rare = np.where(
-        u_left >= 0.0,
-        f_left,
-        np.where(u_right <= 0.0, f_right, 0.0),
-    )
-
-    # Shock
-    shock_speed = 0.5 * (u_left + u_right)
-    flux_shock = np.where(shock_speed >= 0.0, f_left, f_right)
-
-    return np.where(rare, flux_rare, flux_shock)
+def append_endpoint(x: np.ndarray, u: np.ndarray, x_max: float) -> Tuple[np.ndarray, np.ndarray]:
+    x_out = np.concatenate([x, [x_max]])
+    u_out = np.concatenate([u, [u[0]]])
+    return x_out, u_out
 
 
-def step(u: np.ndarray, dx: float, dt: float) -> np.ndarray:
-    """Advance one time step with periodic boundaries."""
-    u_left = u
-    u_right = np.roll(u, -1)
-    flux = godunov_flux(u_left, u_right)  # flux at i+1/2
-    return u - (dt / dx) * (flux - np.roll(flux, 1))
+def append_endpoint_series(u: np.ndarray) -> np.ndarray:
+    return np.concatenate([u, u[:, :1]], axis=1)
+
+
+def initial_condition(x: np.ndarray, a: float, w: float) -> np.ndarray:
+    return a * np.exp(-(x * x) / (2.0 * w * w))
+
+
+def flux_derivative(u: np.ndarray, dx: float) -> np.ndarray:
+    f = 0.5 * u * u
+    return (np.roll(f, -1) - np.roll(f, 1)) / (2.0 * dx)
+
+
+def backward_euler_step(
+    u: np.ndarray, dx: float, dt: float, max_iter: int, tol: float
+) -> Tuple[np.ndarray, int, bool]:
+    """Advance one step with backward Euler via Picard iteration."""
+    u_next = u.copy()
+    for k in range(max_iter):
+        rhs = u - dt * flux_derivative(u_next, dx)
+        err = np.max(np.abs(rhs - u_next))
+        u_next = rhs
+        if err < tol:
+            return u_next, k + 1, True
+    return u_next, max_iter, False
+
+
+def time_grid(cfg: SimConfig) -> Tuple[np.ndarray, int]:
+    steps_float = cfg.t_end / cfg.dt
+    steps = int(round(steps_float))
+    if not np.isclose(steps_float, steps, rtol=0.0, atol=1.0e-12):
+        raise ValueError("t_end must be an integer multiple of dt")
+    t = np.linspace(0.0, cfg.t_end, steps + 1)
+    return t, steps
 
 
 def write_snapshot(out_dir: Path, index: int, t: float, x: np.ndarray, u: np.ndarray) -> None:
@@ -73,59 +105,178 @@ def write_snapshot(out_dir: Path, index: int, t: float, x: np.ndarray, u: np.nda
     np.savez(path, t=t, x=x, u=u)
 
 
-def simulate(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x = np.linspace(0.0, cfg.length, cfg.n, endpoint=False)
-    u0 = initial_condition(x, cfg.ic, cfg.amp)
+def simulate_full(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = make_grid(cfg)
+    u0 = initial_condition(x, cfg.a, cfg.w)
     u = u0.copy()
 
+    t, steps = time_grid(cfg)
+    u_all = np.empty((steps + 1, x.size), dtype=u.dtype)
+    u_all[0] = u0
+
+    for n in range(steps):
+        u, _, converged = backward_euler_step(u, cfg.dx, cfg.dt, cfg.max_iter, cfg.tol)
+        if not converged:
+            raise RuntimeError(f"Nonlinear solver failed to converge at step {n}")
+        u_all[n + 1] = u
+
+    if cfg.include_endpoint:
+        x_out = np.concatenate([x, [cfg.x_max]])
+        u_out = append_endpoint_series(u_all)
+        return x_out, t, u_out
+
+    return x, t, u_all
+
+
+def simulate(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = make_grid(cfg)
+    u0 = initial_condition(x, cfg.a, cfg.w)
+    u = u0.copy()
+
+    _, steps = time_grid(cfg)
+
     t = 0.0
-    dx = cfg.length / cfg.n
-    next_snapshot = None
+    snapshot_every = None
     snapshot_index = 0
     snapshot_dir = None
+
     if cfg.snapshot_interval > 0.0 and cfg.snapshot_dir:
+        snap_float = cfg.snapshot_interval / cfg.dt
+        snapshot_every = int(round(snap_float))
+        if not np.isclose(snap_float, snapshot_every, rtol=0.0, atol=1.0e-12):
+            raise ValueError("snapshot_interval must be an integer multiple of dt")
         snapshot_dir = Path(cfg.snapshot_dir)
-        write_snapshot(snapshot_dir, snapshot_index, t, x, u)
+        x_out, u_out = (x, u)
+        if cfg.include_endpoint:
+            x_out, u_out = append_endpoint(x, u, cfg.x_max)
+        write_snapshot(snapshot_dir, snapshot_index, t, x_out, u_out)
         snapshot_index += 1
-        next_snapshot = cfg.snapshot_interval
 
-    while t < cfg.t_end:
-        max_speed = np.max(np.abs(u))
-        if max_speed == 0.0:
-            dt = cfg.t_end - t
-        else:
-            dt = cfg.cfl * dx / max_speed
-            dt = min(dt, cfg.t_end - t)
+    for n in range(steps):
+        u, _, converged = backward_euler_step(u, cfg.dx, cfg.dt, cfg.max_iter, cfg.tol)
+        if not converged:
+            raise RuntimeError(f"Nonlinear solver failed to converge at step {n}")
+        t += cfg.dt
 
-        if next_snapshot is not None and t + dt > next_snapshot:
-            dt = next_snapshot - t
-
-        u = step(u, dx, dt)
-        t += dt
-
-        if next_snapshot is not None and t >= next_snapshot - 1.0e-12:
-            write_snapshot(snapshot_dir, snapshot_index, t, x, u)
+        if snapshot_every is not None and (n + 1) % snapshot_every == 0:
+            x_out, u_out = (x, u)
+            if cfg.include_endpoint:
+                x_out, u_out = append_endpoint(x, u, cfg.x_max)
+            write_snapshot(snapshot_dir, snapshot_index, t, x_out, u_out)
             snapshot_index += 1
-            next_snapshot += cfg.snapshot_interval
+
+    if cfg.include_endpoint:
+        x_out, u0_out = append_endpoint(x, u0, cfg.x_max)
+        _, u_out = append_endpoint(x, u, cfg.x_max)
+        return x_out, u0_out, u_out
 
     return x, u0, u
 
 
+def make_param_values(v_min: float, v_max: float, v_step: float, name: str) -> np.ndarray:
+    if v_step <= 0.0:
+        raise ValueError(f"{name}_step must be positive")
+    span = v_max - v_min
+    if span < 0.0:
+        raise ValueError(f"{name}_max must be >= {name}_min")
+    count_float = span / v_step
+    count = int(round(count_float))
+    if not np.isclose(count_float, count, rtol=0.0, atol=1.0e-12):
+        raise ValueError(f"{name} range must be an integer multiple of {name}_step")
+    values = v_min + v_step * np.arange(count + 1)
+    return np.round(values, 12)
+
+
+def generate_dataset(
+    cfg: SimConfig,
+    a_values: Iterable[float],
+    w_values: Iterable[float],
+    out_dir: Path,
+) -> None:
+    a_values = list(a_values)
+    w_values = list(w_values)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    index_rows = []
+    x_ref = None
+    t_ref = None
+
+    for a in a_values:
+        for w in w_values:
+            run_cfg = replace(cfg, a=float(a), w=float(w), snapshot_interval=0.0, snapshot_dir="")
+            x, t, u_all = simulate_full(run_cfg)
+
+            if x_ref is None:
+                x_ref = x
+                t_ref = t
+
+            filename = f"a_{a:.6f}_w_{w:.6f}.npz"
+            np.savez(out_dir / filename, a=a, w=w, x=x, t=t, u=u_all)
+            index_rows.append((filename, float(a), float(w)))
+
+    if x_ref is None or t_ref is None:
+        raise RuntimeError("No dataset samples were generated")
+
+    np.savez(
+        out_dir / "dataset_meta.npz",
+        a_values=np.array(list(a_values), dtype=float),
+        w_values=np.array(list(w_values), dtype=float),
+        x=x_ref,
+        t=t_ref,
+        dx=cfg.dx,
+        dt=cfg.dt,
+        x_min=cfg.x_min,
+        x_max=cfg.x_max,
+        t_end=cfg.t_end,
+        include_endpoint=cfg.include_endpoint,
+    )
+
+    index_path = out_dir / "index.csv"
+    with index_path.open("w", encoding="utf-8") as handle:
+        handle.write("filename,a,w\n")
+        for filename, a, w in index_rows:
+            handle.write(f"{filename},{a:.12f},{w:.12f}\n")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inviscid Burgers equation simulation (periodic boundary)."
+        description="1D inviscid Burgers equation (paper replication)."
     )
-    parser.add_argument("--n", type=int, default=200, help="Number of grid points")
-    parser.add_argument("--length", type=float, default=2.0 * np.pi, help="Domain length")
-    parser.add_argument("--t_end", type=float, default=1.0, help="Final time")
-    parser.add_argument("--cfl", type=float, default=0.5, help="CFL number")
+    parser.add_argument("--a", type=float, default=0.8, help="Amplitude parameter a")
+    parser.add_argument("--w", type=float, default=1.0, help="Width parameter w")
+    parser.add_argument("--x-min", type=float, default=-3.0, help="Domain minimum")
+    parser.add_argument("--x-max", type=float, default=3.0, help="Domain maximum")
+    parser.add_argument("--dx", type=float, default=6.0e-3, help="Spatial step")
+    parser.add_argument("--dt", type=float, default=1.0e-3, help="Time step")
+    parser.add_argument("--t-end", type=float, default=1.0, help="Final time")
     parser.add_argument(
-        "--ic",
-        choices=["sine", "square", "gaussian"],
-        default="gaussian",
-        help="Initial condition",
+        "--dataset-dir",
+        type=str,
+        default="",
+        help="If set, generate a dataset over (a, w) grid and save to this directory",
     )
-    parser.add_argument("--amp", type=float, default=1.0, help="Amplitude of IC")
+    parser.add_argument("--a-min", type=float, default=0.7, help="Dataset a minimum")
+    parser.add_argument("--a-max", type=float, default=0.9, help="Dataset a maximum")
+    parser.add_argument("--a-step", type=float, default=0.01, help="Dataset a step")
+    parser.add_argument("--w-min", type=float, default=0.9, help="Dataset w minimum")
+    parser.add_argument("--w-max", type=float, default=1.1, help="Dataset w maximum")
+    parser.add_argument("--w-step", type=float, default=0.01, help="Dataset w step")
+    parser.add_argument(
+        "--no-endpoint",
+        action="store_true",
+        help="Do not append x_max to output (keeps periodic grid only)",
+    )
+    parser.add_argument(
+        "--max-iter",
+        type=int,
+        default=50,
+        help="Max Picard iterations per time step",
+    )
+    parser.add_argument(
+        "--tol",
+        type=float,
+        default=1.0e-10,
+        help="Picard convergence tolerance",
+    )
     parser.add_argument(
         "--snapshot-interval",
         type=float,
@@ -151,15 +302,25 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = SimConfig(
-        n=args.n,
-        length=args.length,
+        x_min=args.x_min,
+        x_max=args.x_max,
+        dx=args.dx,
+        dt=args.dt,
         t_end=args.t_end,
-        cfl=args.cfl,
-        ic=args.ic,
-        amp=args.amp,
+        a=args.a,
+        w=args.w,
+        include_endpoint=not args.no_endpoint,
+        max_iter=args.max_iter,
+        tol=args.tol,
         snapshot_interval=args.snapshot_interval,
         snapshot_dir=args.snapshot_dir,
     )
+
+    if args.dataset_dir:
+        a_values = make_param_values(args.a_min, args.a_max, args.a_step, "a")
+        w_values = make_param_values(args.w_min, args.w_max, args.w_step, "w")
+        generate_dataset(cfg, a_values, w_values, Path(args.dataset_dir))
+        return
 
     x, u0, u = simulate(cfg)
 
@@ -178,7 +339,7 @@ def main() -> None:
     plt.plot(x, u, label=f"t={cfg.t_end}")
     plt.xlabel("x")
     plt.ylabel("u")
-    plt.title("Inviscid Burgers Equation (Periodic)")
+    plt.title("1D Inviscid Burgers (Periodic)")
     plt.legend()
     plt.tight_layout()
 

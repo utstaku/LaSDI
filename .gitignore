@@ -1,1 +1,4 @@
 *.npz
+*.pdf
+*.tex
+*.pyc
