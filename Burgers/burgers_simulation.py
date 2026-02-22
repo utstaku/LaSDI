@@ -32,7 +32,7 @@ from typing import Iterable, Tuple
 
 import numpy as np
 
-
+#from . import utils  # noqa: F401 - for potential future utilities
 @dataclass
 class SimConfig:
     x_min: float = -3.0
