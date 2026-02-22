@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""1D inviscid Burgers equation simulation (paper replication).
+"""1D inviscid Burgers equation simulation.
 
 Governing equation (periodic on [-3, 3]):
     u_t + u u_x = 0
@@ -8,15 +8,16 @@ Governing equation (periodic on [-3, 3]):
 Initial condition (parameterized):
     u(0, x | a, w) = a * exp(-x^2 / (2 w^2))
 
-Defaults follow the paper:
+Defaults:
     dx = 6e-3, dt = 1e-3, t_end = 1.0
     a in [0.7, 0.9], w in [0.9, 1.1]
 
 Numerics:
-    - Backward Euler in time (implicit)
-    - Central finite difference on the conservative flux derivative
-      f(u) = 0.5 * u^2
-    - Nonlinear solve via Picard (fixed-point) iteration
+    - Richtmyer (two-step Lax-Wendroff) scheme
+    - Second-order accurate in both space and time
+    - Stable for hyperbolic conservation laws
+    - Conservative form: f(u) = 0.5 * u^2
+    - Properly handles shock formation in inviscid Burgers
 
 Dataset generation:
     --dataset-dir writes one .npz per (a, w) with full time evolution.
@@ -42,8 +43,6 @@ class SimConfig:
     a: float = 0.8
     w: float = 1.0
     include_endpoint: bool = True
-    max_iter: int = 50
-    tol: float = 1.0e-10
     snapshot_interval: float = 0.0
     snapshot_dir: str = ""
 
@@ -71,23 +70,43 @@ def initial_condition(x: np.ndarray, a: float, w: float) -> np.ndarray:
     return a * np.exp(-(x * x) / (2.0 * w * w))
 
 
-def flux_derivative(u: np.ndarray, dx: float) -> np.ndarray:
-    f = 0.5 * u * u
-    return (np.roll(f, -1) - np.roll(f, 1)) / (2.0 * dx)
+def flux(u: np.ndarray) -> np.ndarray:
+    """Flux function f(u) = 0.5 * u^2 for Burgers equation."""
+    return 0.5 * u * u
 
 
-def backward_euler_step(
-    u: np.ndarray, dx: float, dt: float, max_iter: int, tol: float
+def richtmyer_step(
+    u: np.ndarray, dx: float, dt: float
 ) -> Tuple[np.ndarray, int, bool]:
-    """Advance one step with backward Euler via Picard iteration."""
-    u_next = u.copy()
-    for k in range(max_iter):
-        rhs = u - dt * flux_derivative(u_next, dx)
-        err = np.max(np.abs(rhs - u_next))
-        u_next = rhs
-        if err < tol:
-            return u_next, k + 1, True
-    return u_next, max_iter, False
+    """Advance one step using Richtmyer (two-step Lax-Wendroff) scheme.
+
+    This is a stable, second-order accurate scheme for hyperbolic conservation laws.
+    It handles shocks in the inviscid Burgers equation properly.
+
+    Algorithm:
+    1. Predictor (half step): u_{i+1/2}^* = (u_i + u_{i+1})/2 - dt/(2dx)*(f(u_{i+1}) - f(u_i))
+    2. Corrector (full step): u_i^{n+1} = u_i^n - dt/dx*(f(u_{i+1/2}^*) - f(u_{i-1/2}^*))
+    """
+    # Predictor step: compute values at half-grid points (i+1/2)
+    f = flux(u)
+    f_plus = np.roll(f, -1)  # f at i+1
+    u_plus = np.roll(u, -1)  # u at i+1
+
+    # Half-step values at i+1/2
+    u_half = 0.5 * (u + u_plus) - (dt / (2.0 * dx)) * (f_plus - f)
+
+    # Handle periodic boundary for half-step values
+    # u_half at i-1/2 is obtained by rolling u_half by +1
+    u_half_minus = np.roll(u_half, 1)  # u at i-1/2
+
+    # Corrector step: compute flux at half-points
+    f_half = flux(u_half)
+    f_half_minus = flux(u_half_minus)
+
+    # Full step update
+    u_next = u - (dt / dx) * (f_half - f_half_minus)
+
+    return u_next, 1, True
 
 
 def time_grid(cfg: SimConfig) -> Tuple[np.ndarray, int]:
@@ -115,9 +134,9 @@ def simulate_full(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     u_all[0] = u0
 
     for n in range(steps):
-        u, _, converged = backward_euler_step(u, cfg.dx, cfg.dt, cfg.max_iter, cfg.tol)
+        u, _, converged = richtmyer_step(u, cfg.dx, cfg.dt)
         if not converged:
-            raise RuntimeError(f"Nonlinear solver failed to converge at step {n}")
+            raise RuntimeError(f"Time step failed at step {n}")
         u_all[n + 1] = u
 
     if cfg.include_endpoint:
@@ -153,9 +172,9 @@ def simulate(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         snapshot_index += 1
 
     for n in range(steps):
-        u, _, converged = backward_euler_step(u, cfg.dx, cfg.dt, cfg.max_iter, cfg.tol)
+        u, _, converged = richtmyer_step(u, cfg.dx, cfg.dt)
         if not converged:
-            raise RuntimeError(f"Nonlinear solver failed to converge at step {n}")
+            raise RuntimeError(f"Time step failed at step {n}")
         t += cfg.dt
 
         if snapshot_every is not None and (n + 1) % snapshot_every == 0:
@@ -239,7 +258,7 @@ def generate_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="1D inviscid Burgers equation (paper replication)."
+        description="1D inviscid Burgers equation simulation with Richtmyer scheme."
     )
     parser.add_argument("--a", type=float, default=0.8, help="Amplitude parameter a")
     parser.add_argument("--w", type=float, default=1.0, help="Width parameter w")
@@ -264,18 +283,6 @@ def parse_args() -> argparse.Namespace:
         "--no-endpoint",
         action="store_true",
         help="Do not append x_max to output (keeps periodic grid only)",
-    )
-    parser.add_argument(
-        "--max-iter",
-        type=int,
-        default=50,
-        help="Max Picard iterations per time step",
-    )
-    parser.add_argument(
-        "--tol",
-        type=float,
-        default=1.0e-10,
-        help="Picard convergence tolerance",
     )
     parser.add_argument(
         "--snapshot-interval",
@@ -310,8 +317,6 @@ def main() -> None:
         a=args.a,
         w=args.w,
         include_endpoint=not args.no_endpoint,
-        max_iter=args.max_iter,
-        tol=args.tol,
         snapshot_interval=args.snapshot_interval,
         snapshot_dir=args.snapshot_dir,
     )
