@@ -29,6 +29,9 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from burgers_simulation import initial_condition  # noqa: E402
 
+DEFAULT_DATASET_DIR = SCRIPT_DIR / "dataset"
+DEFAULT_MODEL_DIR = SCRIPT_DIR / "lasdi_model"
+
 try:
     import torch
     import torch.nn as nn
@@ -541,8 +544,16 @@ def parse_args() -> argparse.Namespace:
     sub = parser.add_subparsers(dest="command", required=True)
 
     train = sub.add_parser("train", help="Train AE + SINDy on dataset")
-    train.add_argument("--dataset-dir", required=True, help="Dataset directory")
-    train.add_argument("--model-dir", required=True, help="Output model directory")
+    train.add_argument(
+        "--dataset-dir",
+        default=str(DEFAULT_DATASET_DIR),
+        help="Dataset directory",
+    )
+    train.add_argument(
+        "--model-dir",
+        default=str(DEFAULT_MODEL_DIR),
+        help="Output model directory",
+    )
     train.add_argument("--latent-dim", type=int, default=5, help="Latent dimension")
     train.add_argument(
         "--hidden-sizes",
@@ -572,7 +583,11 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--cpu", action="store_true", help="Force CPU")
 
     predict = sub.add_parser("predict", help="Predict for a new (a, w)")
-    predict.add_argument("--model-dir", required=True, help="Model directory")
+    predict.add_argument(
+        "--model-dir",
+        default=str(DEFAULT_MODEL_DIR),
+        help="Model directory",
+    )
     predict.add_argument("--a", type=float, required=True, help="Amplitude parameter a")
     predict.add_argument("--w", type=float, required=True, help="Width parameter w")
     predict.add_argument("--knn", type=int, default=1, help="kNN neighbors for coeffs")
