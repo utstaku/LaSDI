@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, List, Sequence, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -200,7 +201,8 @@ def train_autoencoder(
     loss_fn = nn.MSELoss()
 
     model.train()
-    for epoch in range(train_cfg.epochs):
+    pbar = tqdm(range(train_cfg.epochs), desc="Training AutoEncoder")
+    for epoch in pbar:
         running = 0.0
         for (batch,) in loader:
             batch = batch.to(device)
@@ -210,9 +212,9 @@ def train_autoencoder(
             loss.backward()
             optimizer.step()
             running += loss.item() * batch.size(0)
-        if (epoch + 1) % max(1, train_cfg.epochs // 10) == 0:
-            avg = running / len(dataset)
-            print(f"epoch {epoch + 1}/{train_cfg.epochs} loss={avg:.6e}")
+        avg = running / len(dataset)
+        pbar.set_postfix({"loss": f"{avg:.6e}"})
+    pbar.close()
     return model
 
 
@@ -477,6 +479,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     model = train_autoencoder(u_norm, ae_cfg, train_cfg, device)
+    print("device:", device)
 
     coeffs_list = []
     params_used = []

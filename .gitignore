@@ -5,3 +5,15 @@
 *.csv
 *.json
 *.Identifier
+*.pt
+*.pth
+*.log
+*.out
+*.err
+*.h5
+*.ckpt
+*.tar
+*.zip
+*.tar.gz
+*.tar.bz2
+*.npy
