@@ -16,4 +16,4 @@
 *.zip
 *.tar.gz
 *.tar.bz2
-*.npy
+*.npy.DS_Store
