@@ -29,6 +29,8 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from burgers_simulation import initial_condition  # noqa: E402
 
+LEARNING_CASES = 5
+
 try:
     import torch
     import torch.nn as nn
@@ -64,7 +66,6 @@ class TrainConfig:
     sindy_degree: int = 1
     sindy_threshold: float = 0.05
     sindy_max_iter: int = 10
-    max_params: int = 0
 
 
 class AutoEncoder(nn.Module):
@@ -133,6 +134,49 @@ def load_index(dataset_dir: Path) -> List[Tuple[str, float, float]]:
     return rows
 
 
+def select_corner_center_rows(
+    rows: Sequence[Tuple[str, float, float]],
+) -> List[Tuple[str, float, float]]:
+    if not rows:
+        return []
+
+    params = np.asarray([[a, w] for _, a, w in rows], dtype=float)
+    a_min, w_min = params.min(axis=0)
+    a_max, w_max = params.max(axis=0)
+    targets = np.asarray(
+        [
+            [a_min, w_min],
+            [a_min, w_max],
+            [a_max, w_min],
+            [a_max, w_max],
+            [0.5 * (a_min + a_max), 0.5 * (w_min + w_max)],
+        ],
+        dtype=float,
+    )
+
+    selected_idx: List[int] = []
+    selected_set = set()
+    for target in targets:
+        dists = np.linalg.norm(params - target, axis=1)
+        for idx in np.argsort(dists):
+            idx_int = int(idx)
+            if idx_int not in selected_set:
+                selected_idx.append(idx_int)
+                selected_set.add(idx_int)
+                break
+
+    # Fallback for degenerate parameter ranges where targets may collapse.
+    if len(selected_idx) < LEARNING_CASES:
+        for idx in range(len(rows)):
+            if idx not in selected_set:
+                selected_idx.append(idx)
+                selected_set.add(idx)
+            if len(selected_idx) == LEARNING_CASES:
+                break
+
+    return [rows[idx] for idx in selected_idx]
+
+
 def downsample_time(u: np.ndarray, t: np.ndarray, stride: int) -> Tuple[np.ndarray, np.ndarray]:
     if stride <= 1:
         return u, t
@@ -158,15 +202,12 @@ def collect_snapshots(
     rows: Sequence[Tuple[str, float, float]],
     time_stride: int,
     drop_endpoint: bool,
-    max_params: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     snapshots = []
     params = []
     x_ref = None
     t_ref = None
-    for idx, (filename, a, w) in enumerate(rows):
-        if max_params > 0 and idx >= max_params:
-            break
+    for filename, a, w in rows:
         x, t, u = load_series(dataset_dir, filename, drop_endpoint, time_stride)
         if x_ref is None:
             x_ref = x
@@ -442,16 +483,21 @@ def train_pipeline(args: argparse.Namespace) -> None:
     dataset_dir = Path(args.dataset_dir)
     model_dir = Path(args.model_dir)
     rows = load_index(dataset_dir)
+    learning_rows = select_corner_center_rows(rows)
+    if not learning_rows:
+        raise RuntimeError("Dataset index is empty")
+    print(f"Using {len(learning_rows)} training cases (4 corners + center)")
+    for _, a, w in learning_rows:
+        print(f"  selected (a={a:.6f}, w={w:.6f})")
 
     if args.time_stride < 1:
         raise ValueError("time_stride must be >= 1")
 
     params, x, t, u_snapshots = collect_snapshots(
         dataset_dir,
-        rows,
+        learning_rows,
         args.time_stride,
         args.drop_endpoint,
-        args.max_params,
     )
     if t.size < 2:
         raise RuntimeError("Time grid must contain at least two points")
@@ -474,7 +520,6 @@ def train_pipeline(args: argparse.Namespace) -> None:
         sindy_degree=args.sindy_degree,
         sindy_threshold=args.sindy_threshold,
         sindy_max_iter=args.sindy_max_iter,
-        max_params=args.max_params,
     )
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -483,9 +528,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
 
     coeffs_list = []
     params_used = []
-    for idx, (filename, a, w) in enumerate(rows):
-        if args.max_params > 0 and idx >= args.max_params:
-            break
+    for filename, a, w in learning_rows:
         _, t_series, u_series = load_series(dataset_dir, filename, args.drop_endpoint, args.time_stride)
         z = encode_series(model, u_series, mean, std, device, args.batch_size)
         xi, terms = fit_sindy(
@@ -563,12 +606,6 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--sindy-degree", type=int, default=1, help="SINDy degree")
     train.add_argument("--sindy-threshold", type=float, default=0.05, help="STLSQ threshold")
     train.add_argument("--sindy-max-iter", type=int, default=10, help="STLSQ iterations")
-    train.add_argument(
-        "--max-params",
-        type=int,
-        default=0,
-        help="Limit number of parameter cases (0 = all)",
-    )
     train.add_argument("--cpu", action="store_true", help="Force CPU")
 
     predict = sub.add_parser("predict", help="Predict for a new (a, w)")
