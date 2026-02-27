@@ -29,6 +29,8 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from burgers_simulation import initial_condition  # noqa: E402
 
+
+LEARNING_CASES = 5  # 4 corners + center for (a, w) parameter space
 DEFAULT_DATASET_DIR = SCRIPT_DIR / "dataset"
 DEFAULT_MODEL_DIR = SCRIPT_DIR / "lasdi_model"
 
