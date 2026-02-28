@@ -30,7 +30,8 @@ if str(SCRIPT_DIR) not in sys.path:
 from burgers_simulation import initial_condition  # noqa: E402
 
 
-LEARNING_CASES = 5  # 4 corners + center for (a, w) parameter space
+GRID_SAMPLES_PER_AXIS = 5
+LEARNING_CASES = GRID_SAMPLES_PER_AXIS * GRID_SAMPLES_PER_AXIS
 DEFAULT_DATASET_DIR = SCRIPT_DIR / "dataset"
 DEFAULT_MODEL_DIR = SCRIPT_DIR / "lasdi_model"
 
@@ -137,29 +138,38 @@ def load_index(dataset_dir: Path) -> List[Tuple[str, float, float]]:
     return rows
 
 
-def select_corner_center_rows(
+def select_grid_rows(
     rows: Sequence[Tuple[str, float, float]],
 ) -> List[Tuple[str, float, float]]:
     if not rows:
         return []
 
+    a_values = np.array(sorted({a for _, a, _ in rows}), dtype=float)
+    w_values = np.array(sorted({w for _, _, w in rows}), dtype=float)
+    a_idx = np.round(np.linspace(0, len(a_values) - 1, GRID_SAMPLES_PER_AXIS)).astype(int)
+    w_idx = np.round(np.linspace(0, len(w_values) - 1, GRID_SAMPLES_PER_AXIS)).astype(int)
+    # Keep order while removing duplicates if the grid is smaller than requested.
+    a_idx = np.asarray(list(dict.fromkeys(a_idx.tolist())), dtype=int)
+    w_idx = np.asarray(list(dict.fromkeys(w_idx.tolist())), dtype=int)
+    target_a = a_values[a_idx]
+    target_w = w_values[w_idx]
+    targets = np.array([(a, w) for a in target_a for w in target_w], dtype=float)
+
+    row_index_map = {(a, w): idx for idx, (_, a, w) in enumerate(rows)}
     params = np.asarray([[a, w] for _, a, w in rows], dtype=float)
-    a_min, w_min = params.min(axis=0)
-    a_max, w_max = params.max(axis=0)
-    targets = np.asarray(
-        [
-            [a_min, w_min],
-            [a_min, w_max],
-            [a_max, w_min],
-            [a_max, w_max],
-            [0.5 * (a_min + a_max), 0.5 * (w_min + w_max)],
-        ],
-        dtype=float,
-    )
 
     selected_idx: List[int] = []
     selected_set = set()
     for target in targets:
+        idx_exact = row_index_map.get((float(target[0]), float(target[1])))
+        if idx_exact is not None:
+            idx_int = int(idx_exact)
+            if idx_int not in selected_set:
+                selected_idx.append(idx_int)
+                selected_set.add(idx_int)
+            continue
+
+        # Fallback: nearest available case if an exact grid point is missing.
         dists = np.linalg.norm(params - target, axis=1)
         for idx in np.argsort(dists):
             idx_int = int(idx)
@@ -168,7 +178,7 @@ def select_corner_center_rows(
                 selected_set.add(idx_int)
                 break
 
-    # Fallback for degenerate parameter ranges where targets may collapse.
+    # Fallback for degenerate or sparse parameter ranges.
     if len(selected_idx) < LEARNING_CASES:
         for idx in range(len(rows)):
             if idx not in selected_set:
@@ -409,6 +419,186 @@ def decode_series(
     return u_norm * std + mean
 
 
+def predict_solution(
+    model: AutoEncoder,
+    mean: np.ndarray,
+    std: np.ndarray,
+    params: np.ndarray,
+    coeffs: np.ndarray,
+    terms,
+    x: np.ndarray,
+    t: np.ndarray,
+    a: float,
+    w: float,
+    knn: int,
+    device: torch.device, # type: ignore
+    batch_size: int,
+    drop_endpoint: bool,
+) -> np.ndarray:
+    if t.size < 2:
+        raise RuntimeError("Time grid must contain at least two points")
+    target = np.array([a, w], dtype=float)
+    dt = t[1] - t[0]
+    steps = t.size - 1
+    coeffs_interp = interpolate_coeffs(params, coeffs, target, knn)
+
+    u0 = initial_condition(x, a, w)
+    if not drop_endpoint:
+        u0[-1] = u0[0]
+    z0 = encode_series(model, u0[None, :], mean, std, device, batch_size)[0]
+
+    z = integrate_latent(z0, coeffs_interp, terms, dt, steps)
+    u_pred = decode_series(model, z, mean, std, device, batch_size)
+    if not drop_endpoint:
+        u_pred[:, -1] = u_pred[:, 0]
+    return u_pred
+
+
+def max_relative_error_percent(u_true: np.ndarray, u_pred: np.ndarray) -> float:
+    if u_true.shape != u_pred.shape:
+        raise ValueError(
+            f"Shape mismatch for error computation: {u_true.shape} vs {u_pred.shape}"
+        )
+    denom = np.linalg.norm(u_true, axis=1)
+    denom = np.maximum(denom, 1.0e-12)
+    rel_over_time = np.linalg.norm(u_pred - u_true, axis=1) / denom
+    return float(np.max(rel_over_time) * 100.0)
+
+
+def build_error_map(
+    dataset_dir: Path,
+    rows: Sequence[Tuple[str, float, float]],
+    model: AutoEncoder,
+    mean: np.ndarray,
+    std: np.ndarray,
+    params: np.ndarray,
+    coeffs: np.ndarray,
+    terms,
+    x: np.ndarray,
+    t: np.ndarray,
+    drop_endpoint: bool,
+    time_stride: int,
+    knn: int,
+    device: torch.device, # type: ignore
+    batch_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    a_values = np.array(sorted({a for _, a, _ in rows}), dtype=float)
+    w_values = np.array(sorted({w for _, _, w in rows}), dtype=float)
+    a_index = {float(a): j for j, a in enumerate(a_values)}
+    w_index = {float(w): i for i, w in enumerate(w_values)}
+    error_grid = np.full((w_values.size, a_values.size), np.nan, dtype=float)
+
+    for filename, a, w in tqdm(rows, desc="Building LaSDI error map"):
+        _, _, u_true = load_series(dataset_dir, filename, drop_endpoint, time_stride)
+        u_pred = predict_solution(
+            model,
+            mean,
+            std,
+            params,
+            coeffs,
+            terms,
+            x,
+            t,
+            a,
+            w,
+            knn,
+            device,
+            batch_size,
+            drop_endpoint,
+        )
+        error_grid[w_index[float(w)], a_index[float(a)]] = max_relative_error_percent(
+            u_true,
+            u_pred,
+        )
+
+    return a_values, w_values, error_grid
+
+
+def cell_edges(values: np.ndarray) -> np.ndarray:
+    if values.size == 1:
+        v = float(values[0])
+        return np.array([v - 0.5, v + 0.5], dtype=float)
+    mids = 0.5 * (values[:-1] + values[1:])
+    left = values[0] - 0.5 * (values[1] - values[0])
+    right = values[-1] + 0.5 * (values[-1] - values[-2])
+    return np.concatenate([[left], mids, [right]])
+
+
+def plot_lasdi_error_map(
+    a_values: np.ndarray,
+    w_values: np.ndarray,
+    error_grid: np.ndarray,
+    train_params: np.ndarray,
+    output_path: Path,
+    vmax: float,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except Exception as exc:
+        raise RuntimeError(
+            "matplotlib is required to save the LaSDI error-map figure."
+        ) from exc
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    a_edges = cell_edges(a_values)
+    w_edges = cell_edges(w_values)
+
+    fig, ax = plt.subplots(figsize=(8.2, 6.0))
+    mesh = ax.pcolormesh(
+        a_edges,
+        w_edges,
+        error_grid,
+        shading="auto",
+        cmap="coolwarm",
+        vmin=0.0,
+        vmax=vmax,
+    )
+
+    for i, w in enumerate(w_values):
+        for j, a in enumerate(a_values):
+            value = error_grid[i, j]
+            if np.isnan(value):
+                continue
+            ax.text(
+                float(a),
+                float(w),
+                f"{value:.1f}",
+                ha="center",
+                va="center",
+                fontsize=5,
+                color="black",
+            )
+
+    a_index = {float(a): j for j, a in enumerate(a_values)}
+    w_index = {float(w): i for i, w in enumerate(w_values)}
+    for a, w in train_params:
+        j = a_index.get(float(a))
+        i = w_index.get(float(w))
+        if j is None or i is None:
+            continue
+        rect = Rectangle(
+            (a_edges[j], w_edges[i]),
+            a_edges[j + 1] - a_edges[j],
+            w_edges[i + 1] - w_edges[i],
+            fill=False,
+            edgecolor="black",
+            linewidth=1.2,
+        )
+        ax.add_patch(rect)
+
+    ax.set_xlabel("a")
+    ax.set_ylabel("w")
+    ax.set_title("LaSDI")
+    ax.set_xlim(a_edges[0], a_edges[-1])
+    ax.set_ylim(w_edges[0], w_edges[-1])
+    cbar = fig.colorbar(mesh, ax=ax, pad=0.02)
+    cbar.set_label("Maximum relative error (%)")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
 def save_model(
     model_dir: Path,
     model: AutoEncoder,
@@ -486,15 +676,23 @@ def train_pipeline(args: argparse.Namespace) -> None:
     dataset_dir = Path(args.dataset_dir)
     model_dir = Path(args.model_dir)
     rows = load_index(dataset_dir)
-    learning_rows = select_corner_center_rows(rows)
+    learning_rows = select_grid_rows(rows)
     if not learning_rows:
         raise RuntimeError("Dataset index is empty")
-    print(f"Using {len(learning_rows)} training cases (4 corners + center)")
+    print(
+        "Using "
+        f"{len(learning_rows)} training cases "
+        f"({GRID_SAMPLES_PER_AXIS}x{GRID_SAMPLES_PER_AXIS} subsampled grid)"
+    )
     for _, a, w in learning_rows:
         print(f"  selected (a={a:.6f}, w={w:.6f})")
 
     if args.time_stride < 1:
         raise ValueError("time_stride must be >= 1")
+    if args.error_map_knn < 1:
+        raise ValueError("error_map_knn must be >= 1")
+    if args.error_map_vmax <= 0.0:
+        raise ValueError("error_map_vmax must be > 0")
 
     params, x, t, u_snapshots = collect_snapshots(
         dataset_dir,
@@ -551,6 +749,48 @@ def train_pipeline(args: argparse.Namespace) -> None:
     save_model(model_dir, model, ae_cfg, train_cfg, mean, std, params_used, coeffs, terms, x, t)
     print(f"Saved model to {model_dir}")
 
+    if not args.no_error_map:
+        error_map_path = (
+            Path(args.error_map_output)
+            if args.error_map_output
+            else model_dir / "lasdi_error_map.png"
+        )
+        a_values, w_values, error_grid = build_error_map(
+            dataset_dir,
+            rows,
+            model,
+            mean,
+            std,
+            params_used,
+            coeffs,
+            terms,
+            x,
+            t,
+            args.drop_endpoint,
+            args.time_stride,
+            args.error_map_knn,
+            device,
+            args.batch_size,
+        )
+        plot_lasdi_error_map(
+            a_values,
+            w_values,
+            error_grid,
+            params_used,
+            error_map_path,
+            args.error_map_vmax,
+        )
+        np.savez(
+            error_map_path.with_suffix(".npz"),
+            a_values=a_values,
+            w_values=w_values,
+            max_rel_err_percent=error_grid,
+            train_params=params_used,
+        )
+        print(f"Saved LaSDI error map figure to {error_map_path}")
+    else:
+        print("Skipped LaSDI error map output (--no-error-map).")
+
 
 def predict_pipeline(args: argparse.Namespace) -> None:
     require_torch()
@@ -560,22 +800,22 @@ def predict_pipeline(args: argparse.Namespace) -> None:
 
     a = float(args.a)
     w = float(args.w)
-    target = np.array([a, w], dtype=float)
-
-    dt = t[1] - t[0]
-    steps = t.size - 1
-    coeffs_interp = interpolate_coeffs(params, coeffs, target, args.knn)
-
-    u0 = initial_condition(x, a, w)
-    if not cfg["drop_endpoint"]:
-        u0[-1] = u0[0]
-    z0 = encode_series(model, u0[None, :], mean, std, device, args.batch_size)[0]
-
-    z = integrate_latent(z0, coeffs_interp, terms, dt, steps)
-    u_pred = decode_series(model, z, mean, std, device, args.batch_size)
-
-    if not cfg["drop_endpoint"]:
-        u_pred[:, -1] = u_pred[:, 0]
+    u_pred = predict_solution(
+        model,
+        mean,
+        std,
+        params,
+        coeffs,
+        terms,
+        x,
+        t,
+        a,
+        w,
+        args.knn,
+        device,
+        args.batch_size,
+        bool(cfg["drop_endpoint"]),
+    )
 
     out = Path(args.output)
     np.savez(out, a=a, w=w, x=x, t=t, u=u_pred)
@@ -617,6 +857,29 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--sindy-degree", type=int, default=1, help="SINDy degree")
     train.add_argument("--sindy-threshold", type=float, default=0.05, help="STLSQ threshold")
     train.add_argument("--sindy-max-iter", type=int, default=10, help="STLSQ iterations")
+    train.add_argument(
+        "--no-error-map",
+        action="store_true",
+        help="Skip LaSDI error-map figure output after training",
+    )
+    train.add_argument(
+        "--error-map-output",
+        type=str,
+        default="",
+        help="Output path for LaSDI error-map image (default: <model-dir>/lasdi_error_map.png)",
+    )
+    train.add_argument(
+        "--error-map-knn",
+        type=int,
+        default=1,
+        help="kNN neighbors used when building LaSDI error map",
+    )
+    train.add_argument(
+        "--error-map-vmax",
+        type=float,
+        default=5.0,
+        help="Colorbar max value (%) for LaSDI error map",
+    )
     train.add_argument("--cpu", action="store_true", help="Force CPU")
 
     predict = sub.add_parser("predict", help="Predict for a new (a, w)")
