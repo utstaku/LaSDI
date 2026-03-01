@@ -65,11 +65,13 @@ class TrainConfig:
     epochs: int = 5000
     batch_size: int = 512
     lr: float = 1.0e-3
+    weight_decay: float = 1.0e-6
     time_stride: int = 1
     drop_endpoint: bool = False
     sindy_degree: int = 1
     sindy_threshold: float = 0.05
     sindy_max_iter: int = 10
+    sindy_ridge: float = 1.0e-5
 
 
 class AutoEncoder(nn.Module):
@@ -251,7 +253,11 @@ def train_autoencoder(
     model = AutoEncoder(ae_cfg).to(device)
     dataset = TensorDataset(torch.from_numpy(u_norm).float())
     loader = DataLoader(dataset, batch_size=train_cfg.batch_size, shuffle=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg.lr)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=train_cfg.lr,
+        weight_decay=train_cfg.weight_decay,
+    )
     loss_fn = nn.MSELoss()
 
     model.train()
@@ -345,8 +351,60 @@ def time_derivative(z: np.ndarray, dt: float) -> np.ndarray:
     return dzdt
 
 
-def stlsq(theta: np.ndarray, dzdt: np.ndarray, threshold: float, max_iter: int) -> np.ndarray:
-    xi = np.linalg.lstsq(theta, dzdt, rcond=None)[0]
+def ridge_regression(theta: np.ndarray, dzdt: np.ndarray, ridge: float) -> np.ndarray:
+    if ridge <= 0.0:
+        return np.linalg.lstsq(theta, dzdt, rcond=None)[0]
+    gram = theta.T @ theta
+    rhs = theta.T @ dzdt
+    reg = ridge * np.eye(gram.shape[0], dtype=theta.dtype)
+    return np.linalg.solve(gram + reg, rhs)
+
+
+def standardize_library(theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    theta_mean = theta.mean(axis=0)
+    theta_std = theta.std(axis=0)
+
+    # Keep near-constant columns unchanged to avoid collapsing the constant term.
+    variable = theta_std > 1.0e-12
+    theta_scaled = theta.copy()
+    theta_scaled[:, variable] = (theta[:, variable] - theta_mean[variable]) / theta_std[variable]
+    theta_scaled[:, ~variable] = theta[:, ~variable]
+
+    mean_eff = np.zeros_like(theta_mean)
+    std_eff = np.ones_like(theta_std)
+    mean_eff[variable] = theta_mean[variable]
+    std_eff[variable] = theta_std[variable]
+
+    const_idx = 0
+    for j in range(theta.shape[1]):
+        if np.allclose(theta[:, j], 1.0):
+            const_idx = j
+            break
+
+    return theta_scaled, mean_eff, std_eff, const_idx
+
+
+def unscale_coefficients(
+    xi_scaled: np.ndarray,
+    theta_mean: np.ndarray,
+    theta_std: np.ndarray,
+    const_idx: int,
+) -> np.ndarray:
+    xi = xi_scaled / theta_std[:, None]
+    mean_shift = ((theta_mean / theta_std)[:, None] * xi_scaled).sum(axis=0)
+    xi[const_idx] -= mean_shift
+    return xi
+
+
+def stlsq(
+    theta: np.ndarray,
+    dzdt: np.ndarray,
+    threshold: float,
+    max_iter: int,
+    ridge: float,
+) -> np.ndarray:
+    theta_scaled, theta_mean, theta_std, const_idx = standardize_library(theta)
+    xi = ridge_regression(theta_scaled, dzdt, ridge)
     for _ in range(max_iter):
         small = np.abs(xi) < threshold
         xi[small] = 0.0
@@ -354,15 +412,22 @@ def stlsq(theta: np.ndarray, dzdt: np.ndarray, threshold: float, max_iter: int) 
             big = ~small[:, k]
             if not np.any(big):
                 continue
-            xi[big, k] = np.linalg.lstsq(theta[:, big], dzdt[:, k], rcond=None)[0]
-    return xi
+            xi[big, k] = ridge_regression(theta_scaled[:, big], dzdt[:, k], ridge)
+    return unscale_coefficients(xi, theta_mean, theta_std, const_idx)
 
 
-def fit_sindy(z: np.ndarray, dt: float, degree: int, threshold: float, max_iter: int):
+def fit_sindy(
+    z: np.ndarray,
+    dt: float,
+    degree: int,
+    threshold: float,
+    max_iter: int,
+    ridge: float,
+):
     terms = build_terms(z.shape[1], degree)
     theta = build_library(z, terms)
     dzdt = time_derivative(z, dt)
-    xi = stlsq(theta, dzdt, threshold, max_iter)
+    xi = stlsq(theta, dzdt, threshold, max_iter, ridge)
     return xi, terms
 
 
@@ -372,12 +437,18 @@ def interpolate_coeffs(
     target: np.ndarray,
     k: int,
 ) -> np.ndarray:
+    params_min = params.min(axis=0)
+    params_span = params.max(axis=0) - params_min
+    params_span[params_span < 1.0e-12] = 1.0
+    params_norm = (params - params_min) / params_span
+    target_norm = (target - params_min) / params_span
+    dists = np.linalg.norm(params_norm - target_norm, axis=1)
+
     if k <= 1 or params.shape[0] == 1:
-        idx = int(np.argmin(np.linalg.norm(params - target, axis=1)))
+        idx = int(np.argmin(dists))
         return coeffs[idx]
-    dists = np.linalg.norm(params - target, axis=1)
     idx = np.argsort(dists)[:k]
-    weights = 1.0 / (dists[idx] + 1.0e-12)
+    weights = 1.0 / (dists[idx] ** 2 + 1.0e-12)
     weights /= weights.sum()
     return np.tensordot(weights, coeffs[idx], axes=(0, 0))
 
@@ -629,11 +700,13 @@ def save_model(
         "epochs": int(train_cfg.epochs),
         "batch_size": int(train_cfg.batch_size),
         "lr": float(train_cfg.lr),
+        "weight_decay": float(train_cfg.weight_decay),
         "time_stride": int(train_cfg.time_stride),
         "drop_endpoint": bool(train_cfg.drop_endpoint),
         "sindy_degree": int(train_cfg.sindy_degree),
         "sindy_threshold": float(train_cfg.sindy_threshold),
         "sindy_max_iter": int(train_cfg.sindy_max_iter),
+        "sindy_ridge": float(train_cfg.sindy_ridge),
     }
     with (model_dir / "config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
@@ -693,6 +766,10 @@ def train_pipeline(args: argparse.Namespace) -> None:
         raise ValueError("error_map_knn must be >= 1")
     if args.error_map_vmax <= 0.0:
         raise ValueError("error_map_vmax must be > 0")
+    if args.weight_decay < 0.0:
+        raise ValueError("weight_decay must be >= 0")
+    if args.sindy_ridge < 0.0:
+        raise ValueError("sindy_ridge must be >= 0")
 
     params, x, t, u_snapshots = collect_snapshots(
         dataset_dir,
@@ -716,11 +793,13 @@ def train_pipeline(args: argparse.Namespace) -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         time_stride=args.time_stride,
         drop_endpoint=args.drop_endpoint,
         sindy_degree=args.sindy_degree,
         sindy_threshold=args.sindy_threshold,
         sindy_max_iter=args.sindy_max_iter,
+        sindy_ridge=args.sindy_ridge,
     )
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -738,6 +817,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
             args.sindy_degree,
             args.sindy_threshold,
             args.sindy_max_iter,
+            args.sindy_ridge,
         )
         coeffs_list.append(xi)
         params_used.append([a, w])
@@ -844,10 +924,16 @@ def parse_args() -> argparse.Namespace:
         default=[100],
         help="Comma-separated hidden sizes (e.g., 100,100)",
     )
-    train.add_argument("--activation", type=str, default="sigmoid", help="Activation")
+    train.add_argument("--activation", type=str, default="tanh", help="Activation")
     train.add_argument("--epochs", type=int, default=5000, help="Training epochs")
     train.add_argument("--batch-size", type=int, default=512, help="Batch size")
     train.add_argument("--lr", type=float, default=1.0e-3, help="Learning rate")
+    train.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1.0e-6,
+        help="Adam weight decay",
+    )
     train.add_argument("--time-stride", type=int, default=1, help="Time stride")
     train.add_argument(
         "--drop-endpoint",
@@ -857,6 +943,12 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--sindy-degree", type=int, default=1, help="SINDy degree")
     train.add_argument("--sindy-threshold", type=float, default=0.05, help="STLSQ threshold")
     train.add_argument("--sindy-max-iter", type=int, default=10, help="STLSQ iterations")
+    train.add_argument(
+        "--sindy-ridge",
+        type=float,
+        default=1.0e-5,
+        help="Ridge regularization for STLSQ",
+    )
     train.add_argument(
         "--no-error-map",
         action="store_true",
