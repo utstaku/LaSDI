@@ -423,20 +423,27 @@ def fit_sindy(
     threshold: float,
     max_iter: int,
     ridge: float,
+    z_mean: np.ndarray | None = None,
+    z_std: np.ndarray | None = None,
 ):
+    if z_mean is None:
+        z_mean = z.mean(axis=0)
+    if z_std is None:
+        z_std = z.std(axis=0)
+    z_std = np.maximum(z_std, 1.0e-8)
+    z_hat = (z - z_mean) / z_std
     terms = build_terms(z.shape[1], degree)
-    theta = build_library(z, terms)
-    dzdt = time_derivative(z, dt)
+    theta = build_library(z_hat, terms)
+    dzdt = time_derivative(z_hat, dt)
     xi = stlsq(theta, dzdt, threshold, max_iter, ridge)
     return xi, terms
 
 
-def interpolate_coeffs(
+def knn_indices_weights(
     params: np.ndarray,
-    coeffs: np.ndarray,
     target: np.ndarray,
     k: int,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     params_min = params.min(axis=0)
     params_span = params.max(axis=0) - params_min
     params_span[params_span < 1.0e-12] = 1.0
@@ -446,27 +453,156 @@ def interpolate_coeffs(
 
     if k <= 1 or params.shape[0] == 1:
         idx = int(np.argmin(dists))
-        return coeffs[idx]
-    idx = np.argsort(dists)[:k]
+        return np.array([idx], dtype=int), np.array([1.0], dtype=float)
+
+    idx = np.argsort(dists)[:k].astype(int)
     weights = 1.0 / (dists[idx] ** 2 + 1.0e-12)
     weights /= weights.sum()
+    return idx, weights
+
+
+def interpolate_coeffs(
+    params: np.ndarray,
+    coeffs: np.ndarray,
+    target: np.ndarray,
+    k: int,
+) -> np.ndarray:
+    idx, weights = knn_indices_weights(params, target, k)
+    if idx.size == 1:
+        return coeffs[int(idx[0])]
     return np.tensordot(weights, coeffs[idx], axes=(0, 0))
+
+
+def interpolate_latent_stats(
+    params: np.ndarray,
+    latent_stats: np.ndarray,
+    target: np.ndarray,
+    k: int,
+) -> np.ndarray:
+    idx, weights = knn_indices_weights(params, target, k)
+    if idx.size == 1:
+        return latent_stats[int(idx[0])]
+    return np.tensordot(weights, latent_stats[idx], axes=(0, 0))
 
 
 def integrate_latent(z0: np.ndarray, coeffs: np.ndarray, terms, dt: float, steps: int) -> np.ndarray:
     z = np.empty((steps + 1, z0.size), dtype=z0.dtype)
     z[0] = z0
+    if steps == 0:
+        return z
 
     def rhs(z_state: np.ndarray) -> np.ndarray:
         theta = evaluate_terms(z_state, terms)
         return theta @ coeffs
 
-    for n in range(steps):
-        k1 = rhs(z[n])
-        k2 = rhs(z[n] + 0.5 * dt * k1)
-        k3 = rhs(z[n] + 0.5 * dt * k2)
-        k4 = rhs(z[n] + dt * k3)
-        z[n + 1] = z[n] + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    def dopri_step(z_state: np.ndarray, h: float) -> Tuple[np.ndarray, np.ndarray]:
+        k1 = rhs(z_state)
+        k2 = rhs(z_state + h * (1.0 / 5.0) * k1)
+        k3 = rhs(z_state + h * ((3.0 / 40.0) * k1 + (9.0 / 40.0) * k2))
+        k4 = rhs(
+            z_state
+            + h
+            * (
+                (44.0 / 45.0) * k1
+                + (-56.0 / 15.0) * k2
+                + (32.0 / 9.0) * k3
+            )
+        )
+        k5 = rhs(
+            z_state
+            + h
+            * (
+                (19372.0 / 6561.0) * k1
+                + (-25360.0 / 2187.0) * k2
+                + (64448.0 / 6561.0) * k3
+                + (-212.0 / 729.0) * k4
+            )
+        )
+        k6 = rhs(
+            z_state
+            + h
+            * (
+                (9017.0 / 3168.0) * k1
+                + (-355.0 / 33.0) * k2
+                + (46732.0 / 5247.0) * k3
+                + (49.0 / 176.0) * k4
+                + (-5103.0 / 18656.0) * k5
+            )
+        )
+        k7 = rhs(
+            z_state
+            + h
+            * (
+                (35.0 / 384.0) * k1
+                + (500.0 / 1113.0) * k3
+                + (125.0 / 192.0) * k4
+                + (-2187.0 / 6784.0) * k5
+                + (11.0 / 84.0) * k6
+            )
+        )
+
+        z_5th = z_state + h * (
+            (35.0 / 384.0) * k1
+            + (500.0 / 1113.0) * k3
+            + (125.0 / 192.0) * k4
+            + (-2187.0 / 6784.0) * k5
+            + (11.0 / 84.0) * k6
+        )
+        z_4th = z_state + h * (
+            (5179.0 / 57600.0) * k1
+            + (7571.0 / 16695.0) * k3
+            + (393.0 / 640.0) * k4
+            + (-92097.0 / 339200.0) * k5
+            + (187.0 / 2100.0) * k6
+            + (1.0 / 40.0) * k7
+        )
+        err = z_5th - z_4th
+        return z_5th, err
+
+    rtol = 1.0e-6
+    atol = 1.0e-9
+    safety = 0.9
+    min_scale = 0.2
+    max_scale = 5.0
+    min_h = max(1.0e-14, 1.0e-12 * dt)
+
+    t_current = 0.0
+    z_current = z0.astype(float, copy=True)
+    h = dt
+
+    for out_idx in range(1, steps + 1):
+        t_target = out_idx * dt
+        guard = 0
+        while t_current < t_target:
+            guard += 1
+            if guard > 100000:
+                raise RuntimeError("RK45 integration exceeded maximum substeps")
+
+            h_step = min(h, t_target - t_current)
+            z_trial, err = dopri_step(z_current, h_step)
+            scale = atol + rtol * np.maximum(np.abs(z_current), np.abs(z_trial))
+            err_norm = np.sqrt(np.mean((err / scale) ** 2))
+
+            if err_norm <= 1.0:
+                t_current += h_step
+                z_current = z_trial
+                if err_norm == 0.0:
+                    h = min(dt, h_step * max_scale)
+                else:
+                    h = min(
+                        dt,
+                        h_step
+                        * np.clip(safety * err_norm ** (-1.0 / 5.0), min_scale, max_scale),
+                    )
+            else:
+                h = h_step * max(min_scale, safety * err_norm ** (-1.0 / 5.0))
+                if h < min_h:
+                    raise RuntimeError(
+                        "RK45 integration step size underflow; latent dynamics may be unstable"
+                    )
+
+        z[out_idx] = z_current.astype(z0.dtype, copy=False)
+
     return z
 
 
@@ -496,6 +632,8 @@ def predict_solution(
     std: np.ndarray,
     params: np.ndarray,
     coeffs: np.ndarray,
+    latent_means: np.ndarray,
+    latent_stds: np.ndarray,
     terms,
     x: np.ndarray,
     t: np.ndarray,
@@ -512,13 +650,24 @@ def predict_solution(
     dt = t[1] - t[0]
     steps = t.size - 1
     coeffs_interp = interpolate_coeffs(params, coeffs, target, knn)
+    if latent_means.ndim == 1 and latent_stds.ndim == 1:
+        z_mean_interp = latent_means
+        z_std_interp = np.maximum(latent_stds, 1.0e-8)
+    else:
+        z_mean_interp = interpolate_latent_stats(params, latent_means, target, knn)
+        z_std_interp = np.maximum(
+            interpolate_latent_stats(params, latent_stds, target, knn),
+            1.0e-8,
+        )
 
     u0 = initial_condition(x, a, w)
     if not drop_endpoint:
         u0[-1] = u0[0]
     z0 = encode_series(model, u0[None, :], mean, std, device, batch_size)[0]
+    z0_hat = (z0 - z_mean_interp) / z_std_interp
 
-    z = integrate_latent(z0, coeffs_interp, terms, dt, steps)
+    z_hat = integrate_latent(z0_hat, coeffs_interp, terms, dt, steps)
+    z = z_hat * z_std_interp + z_mean_interp
     u_pred = decode_series(model, z, mean, std, device, batch_size)
     if not drop_endpoint:
         u_pred[:, -1] = u_pred[:, 0]
@@ -544,6 +693,8 @@ def build_error_map(
     std: np.ndarray,
     params: np.ndarray,
     coeffs: np.ndarray,
+    latent_means: np.ndarray,
+    latent_stds: np.ndarray,
     terms,
     x: np.ndarray,
     t: np.ndarray,
@@ -567,6 +718,8 @@ def build_error_map(
             std,
             params,
             coeffs,
+            latent_means,
+            latent_stds,
             terms,
             x,
             t,
@@ -679,6 +832,8 @@ def save_model(
     std: np.ndarray,
     params: np.ndarray,
     coeffs: np.ndarray,
+    latent_means: np.ndarray,
+    latent_stds: np.ndarray,
     terms,
     x: np.ndarray,
     t: np.ndarray,
@@ -688,6 +843,7 @@ def save_model(
     np.savez(model_dir / "normalization.npz", mean=mean, std=std)
     np.save(model_dir / "params.npy", params)
     np.save(model_dir / "sindy_coeffs.npy", coeffs)
+    np.savez(model_dir / "latent_scaling.npz", mean=latent_means, std=latent_stds)
     np.savez(model_dir / "grid.npz", x=x, t=t)
     with (model_dir / "sindy_terms.json").open("w", encoding="utf-8") as handle:
         json.dump(term_names(terms), handle, indent=2)
@@ -707,6 +863,8 @@ def save_model(
         "sindy_threshold": float(train_cfg.sindy_threshold),
         "sindy_max_iter": int(train_cfg.sindy_max_iter),
         "sindy_ridge": float(train_cfg.sindy_ridge),
+        "latent_standardized_for_sindy": True,
+        "latent_scaling_scope": "global",
     }
     with (model_dir / "config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
@@ -731,6 +889,14 @@ def load_model(model_dir: Path, device: torch.device): # type: ignore
     std = norm["std"]
     params = np.load(model_dir / "params.npy")
     coeffs = np.load(model_dir / "sindy_coeffs.npy")
+    latent_scaling_path = model_dir / "latent_scaling.npz"
+    if latent_scaling_path.exists():
+        latent_scaling = np.load(latent_scaling_path)
+        latent_means = latent_scaling["mean"]
+        latent_stds = latent_scaling["std"]
+    else:
+        latent_means = np.zeros((ae_cfg.latent_dim,), dtype=float)
+        latent_stds = np.ones((ae_cfg.latent_dim,), dtype=float)
     grid = np.load(model_dir / "grid.npz")
     x = grid["x"]
     t = grid["t"]
@@ -741,7 +907,7 @@ def load_model(model_dir: Path, device: torch.device): # type: ignore
     if term_names(terms) != term_labels:
         raise RuntimeError("Stored SINDy terms do not match generated terms")
 
-    return model, mean, std, params, coeffs, terms, x, t, cfg
+    return model, mean, std, params, coeffs, latent_means, latent_stds, terms, x, t, cfg
 
 
 def train_pipeline(args: argparse.Namespace) -> None:
@@ -806,11 +972,22 @@ def train_pipeline(args: argparse.Namespace) -> None:
     model = train_autoencoder(u_norm, ae_cfg, train_cfg, device)
     print("device:", device)
 
-    coeffs_list = []
+    encoded_series_list = []
     params_used = []
     for filename, a, w in learning_rows:
-        _, t_series, u_series = load_series(dataset_dir, filename, args.drop_endpoint, args.time_stride)
+        _, _, u_series = load_series(dataset_dir, filename, args.drop_endpoint, args.time_stride)
         z = encode_series(model, u_series, mean, std, device, args.batch_size)
+        encoded_series_list.append(z)
+        params_used.append([a, w])
+
+    z_all = np.vstack(encoded_series_list)
+    latent_means = z_all.mean(axis=0)
+    latent_stds = np.maximum(z_all.std(axis=0), 1.0e-8)
+    print("Global latent scaling stats computed across all learning cases.")
+    print("max|z_hat(all)|", np.max(np.abs((z_all - latent_means) / latent_stds)))
+
+    coeffs_list = []
+    for (_, a, w), z in zip(learning_rows, encoded_series_list):
         xi, terms = fit_sindy(
             z,
             dt,
@@ -818,15 +995,35 @@ def train_pipeline(args: argparse.Namespace) -> None:
             args.sindy_threshold,
             args.sindy_max_iter,
             args.sindy_ridge,
+            latent_means,
+            latent_stds,
         )
         coeffs_list.append(xi)
-        params_used.append([a, w])
+        z_hat = (z - latent_means) / latent_stds
         print(f"SINDy fit for a={a:.3f}, w={w:.3f} terms={xi.shape[0]}")
+        print("max|z_hat|", np.max(np.abs(z_hat)))
+        print("max|dzdt_hat|", np.max(np.abs(time_derivative(z_hat, dt))))
+        print("||Xi||", np.linalg.norm(xi))
 
     coeffs = np.stack(coeffs_list, axis=0)
     params_used = np.asarray(params_used)
+    print(np.linalg.norm(coeffs, axis=(1, 2)))
 
-    save_model(model_dir, model, ae_cfg, train_cfg, mean, std, params_used, coeffs, terms, x, t)
+    save_model(
+        model_dir,
+        model,
+        ae_cfg,
+        train_cfg,
+        mean,
+        std,
+        params_used,
+        coeffs,
+        latent_means,
+        latent_stds,
+        terms,
+        x,
+        t,
+    )
     print(f"Saved model to {model_dir}")
 
     if not args.no_error_map:
@@ -843,6 +1040,8 @@ def train_pipeline(args: argparse.Namespace) -> None:
             std,
             params_used,
             coeffs,
+            latent_means,
+            latent_stds,
             terms,
             x,
             t,
@@ -876,7 +1075,7 @@ def predict_pipeline(args: argparse.Namespace) -> None:
     require_torch()
     model_dir = Path(args.model_dir)
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
-    model, mean, std, params, coeffs, terms, x, t, cfg = load_model(model_dir, device)
+    model, mean, std, params, coeffs, latent_means, latent_stds, terms, x, t, cfg = load_model(model_dir, device)
 
     a = float(args.a)
     w = float(args.w)
@@ -886,6 +1085,8 @@ def predict_pipeline(args: argparse.Namespace) -> None:
         std,
         params,
         coeffs,
+        latent_means,
+        latent_stds,
         terms,
         x,
         t,
@@ -941,7 +1142,14 @@ def parse_args() -> argparse.Namespace:
         help="Drop periodic endpoint before training",
     )
     train.add_argument("--sindy-degree", type=int, default=1, help="SINDy degree")
-    train.add_argument("--sindy-threshold", type=float, default=0.05, help="STLSQ threshold")
+    train.add_argument(
+        "--sindy-threshold",
+        "--sindy-threshould",
+        dest="sindy_threshold",
+        type=float,
+        default=0.05,
+        help="STLSQ threshold",
+    )
     train.add_argument("--sindy-max-iter", type=int, default=10, help="STLSQ iterations")
     train.add_argument(
         "--sindy-ridge",
