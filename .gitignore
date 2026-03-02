@@ -19,3 +19,4 @@
 *.npy
 *.DS_Store
 LaSDI
+*.p
