@@ -21,11 +21,16 @@ Numerics:
 
 Dataset generation:
     --dataset-dir writes one .npz per (a, w) with full time evolution.
+    Also writes Build_1DBurgers.py-compatible files:
+        - snapshot_git.p (stacked snapshots over all parameter pairs)
+        - FOM.p (single FOM rollout at a=0.8, w=1.0 with elapsed time)
 """
 
 from __future__ import annotations
 
 import argparse
+import pickle
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Tuple
@@ -211,11 +216,15 @@ def generate_dataset(
     a_values: Iterable[float],
     w_values: Iterable[float],
     out_dir: Path,
+    write_legacy_pickles: bool = True,
+    fom_a: float = 0.8,
+    fom_w: float = 1.0,
 ) -> None:
     a_values = list(a_values)
     w_values = list(w_values)
     out_dir.mkdir(parents=True, exist_ok=True)
     index_rows = []
+    snapshot_rows = []
     x_ref = None
     t_ref = None
 
@@ -231,6 +240,7 @@ def generate_dataset(
             filename = f"a_{a:.6f}_w_{w:.6f}.npz"
             np.savez(out_dir / filename, a=a, w=w, x=x, t=t, u=u_all)
             index_rows.append((filename, float(a), float(w)))
+            snapshot_rows.append(u_all)
 
     if x_ref is None or t_ref is None:
         raise RuntimeError("No dataset samples were generated")
@@ -254,6 +264,27 @@ def generate_dataset(
         handle.write("filename,a,w\n")
         for filename, a, w in index_rows:
             handle.write(f"{filename},{a:.12f},{w:.12f}\n")
+
+    if write_legacy_pickles:
+        snapshot_full = np.vstack(snapshot_rows).astype(np.float32, copy=False)
+        with (out_dir / "snapshot_git.p").open("wb") as handle:
+            pickle.dump(snapshot_full, handle)
+
+        fom_cfg = replace(
+            cfg,
+            a=float(fom_a),
+            w=float(fom_w),
+            snapshot_interval=0.0,
+            snapshot_dir="",
+        )
+        fom_start = time.perf_counter()
+        _, _, snapshot_full_fom = simulate_full(fom_cfg)
+        fom_time = time.perf_counter() - fom_start
+        with (out_dir / "FOM.p").open("wb") as handle:
+            pickle.dump(
+                {"FOM": snapshot_full_fom.astype(np.float32, copy=False), "time": fom_time},
+                handle,
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -279,6 +310,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-min", type=float, default=0.9, help="Dataset w minimum")
     parser.add_argument("--w-max", type=float, default=1.1, help="Dataset w maximum")
     parser.add_argument("--w-step", type=float, default=0.01, help="Dataset w step")
+    parser.add_argument(
+        "--no-legacy-pickles",
+        action="store_true",
+        help="Disable writing Build_1DBurgers.py-compatible snapshot_git.p and FOM.p",
+    )
+    parser.add_argument("--fom-a", type=float, default=0.8, help="FOM amplitude for FOM.p")
+    parser.add_argument("--fom-w", type=float, default=1.0, help="FOM width for FOM.p")
     parser.add_argument(
         "--no-endpoint",
         action="store_true",
@@ -324,7 +362,15 @@ def main() -> None:
     if args.dataset_dir:
         a_values = make_param_values(args.a_min, args.a_max, args.a_step, "a")
         w_values = make_param_values(args.w_min, args.w_max, args.w_step, "w")
-        generate_dataset(cfg, a_values, w_values, Path(args.dataset_dir))
+        generate_dataset(
+            cfg,
+            a_values,
+            w_values,
+            Path(args.dataset_dir),
+            write_legacy_pickles=not args.no_legacy_pickles,
+            fom_a=args.fom_a,
+            fom_w=args.fom_w,
+        )
         return
 
     x, u0, u = simulate(cfg)

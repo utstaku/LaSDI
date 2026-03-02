@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pickle
+
 import numpy as np
 
 from burgers_simulation import SimConfig, generate_dataset, make_param_values, simulate_full
@@ -36,9 +38,15 @@ def test_generate_dataset_writes_files(tmp_path):
 
     assert (tmp_path / "dataset_meta.npz").exists()
     assert (tmp_path / "index.csv").exists()
+    assert (tmp_path / "snapshot_git.p").exists()
+    assert (tmp_path / "FOM.p").exists()
 
     files = sorted(tmp_path.glob("a_*_w_*.npz"))
     assert len(files) == 2
 
     data = np.load(files[0])
     assert "u" in data
+
+    snapshot_full = pickle.load((tmp_path / "snapshot_git.p").open("rb"))
+    # 2 parameter pairs and each rollout has (Nt+1)=3 time states.
+    assert snapshot_full.shape[0] == 2 * 3
