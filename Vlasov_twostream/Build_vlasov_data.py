@@ -6,9 +6,9 @@ from scipy.interpolate import CubicSpline
 # Config
 # =========================
 # grid
-N = 64         # x grid
-M = 32         # v grid half (total 2M points)
-Vmax = 6.0
+N = 128         # x grid
+M = 64         # v grid half (total 2M points)
+Vmax = 7.0
 dt = 5e-3
 tmax = 5.0
 
@@ -17,18 +17,30 @@ T_min, T_max, dT = 0.9, 1.1, 0.01
 k_min, k_max, dk = 1.0, 1.2, 0.01
 
 # domain for Eq.(39): cos(k*pi*x) -> natural to use x in [-1, 1)
-x_left, x_right = -1.0, 1.0
+x_left, x_right = 0, 2.0*np.pi
 
 save_root = "vlasov_twostream_param_grid"
+
+# animation output
+save_animation_data = True
+animation_stride = 10  # save every Nth time step
+animation_dtype = np.float32
+
+# ML output (full state history)
+save_ml_distribution_data = True
+ml_distribution_dtype = np.float32
 
 # =========================
 # Grid setup
 # =========================
 # v grid (total 2M points)
+"""
 dv = 2 * Vmax / (2 * M - 1)
 v_index = np.arange(-M, M, 1, dtype=float)
 v = v_index * dv
-
+"""
+v = np.linspace(-Vmax, Vmax, 2*M, endpoint=True)
+dv = v[1] - v[0]
 # x grid (periodic)
 L = x_right - x_left
 dx = L / N
@@ -119,24 +131,36 @@ def initial_f_twostream(x_arr, v_arr, T, k, eps=0.1, vd=2.0):
     X = x_arr[:, None]
     V = v_arr[None, :]
 
-    spatial = 1.0 + eps * np.cos(k * np.pi * X)
+    spatial = 1.0 + eps * np.cos(k * X)
     streams = np.exp(-((V - vd) ** 2) / (2.0 * T)) + np.exp(-((V + vd) ** 2) / (2.0 * T))
-    f = (4.0 / (np.pi * T)) * spatial * streams
+    #f = (4.0 / (np.pi * T)) * spatial * streams
+    f = (8.0 / (np.sqrt(2.0*np.pi*T))) * spatial * streams
     return f
 
 # =========================
 # One case runner
 # =========================
-def run_vlasov_case_twostream(T, k, save_dir):
+def run_vlasov_case_twostream(
+    T,
+    k,
+    save_dir,
+    save_animation=save_animation_data,
+    frame_stride=animation_stride,
+    save_ml_distribution=save_ml_distribution_data,
+):
     os.makedirs(save_dir, exist_ok=True)
+    frame_stride = max(1, int(frame_stride))
 
     # init f
     f = initial_f_twostream(x, v, T=T, k=k, eps=0.1, vd=2.0)
 
     # time loop
     t_list, n_list, u_list, p_list, dqdx_list = [], [], [], [], []
+    t_anim_list, f_anim_list, E_anim_list = [], [], []
+    f_ml_list = []
 
     t = 0.0
+    step = 0
     while t < tmax + 1e-12:
         n = density(f)
         u = velocity(f)
@@ -148,6 +172,14 @@ def run_vlasov_case_twostream(T, k, save_dir):
         u_list.append(u)
         p_list.append(p)
         dqdx_list.append(dqdx)
+        if save_ml_distribution:
+            f_ml_list.append(f.astype(ml_distribution_dtype, copy=True))
+
+        if save_animation and (step % frame_stride == 0):
+            E_now, _, _ = poisson_E_caluc(f)
+            t_anim_list.append(t)
+            f_anim_list.append(f.astype(animation_dtype, copy=True))
+            E_anim_list.append(E_now.astype(animation_dtype, copy=True))
 
         # split scheme (same as your code)
         f = shift_x_semi_lagrangian(f, v, dt * 0.5)
@@ -156,6 +188,7 @@ def run_vlasov_case_twostream(T, k, save_dir):
         f = shift_x_semi_lagrangian(f, v, dt * 0.5)
 
         t += dt
+        step += 1
 
     # save
     np.savez(
@@ -183,7 +216,33 @@ def run_vlasov_case_twostream(T, k, save_dir):
         M=M,
     )
 
-    print(f"[OK] T={T:.2f}, k={k:.2f} saved to {save_dir}  (Nt={len(t_list)})")
+    if save_animation:
+        np.savez_compressed(
+            os.path.join(save_dir, "animation_data.npz"),
+            t=np.array(t_anim_list),
+            f=np.array(f_anim_list, dtype=animation_dtype),
+            E=np.array(E_anim_list, dtype=animation_dtype),
+            x=x.astype(animation_dtype),
+            v=v.astype(animation_dtype),
+            frame_stride=frame_stride,
+            dt=dt,
+            tmax=tmax,
+        )
+
+    if save_ml_distribution:
+        np.savez_compressed(
+            os.path.join(save_dir, "distribution_full.npz"),
+            t=np.array(t_list),
+            f=np.array(f_ml_list, dtype=ml_distribution_dtype),
+            x=x.astype(ml_distribution_dtype),
+            v=v.astype(ml_distribution_dtype),
+            T=T,
+            k=k,
+            dt=dt,
+            tmax=tmax,
+        )
+
+    print(f"[OK] T={T:.2f}, k={k:.2f} saved to {save_dir}  (Nt={len(t_list)}, Nframes={len(t_anim_list)})")
 
 # =========================
 # Parameter grid generator
