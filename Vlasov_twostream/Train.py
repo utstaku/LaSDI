@@ -111,6 +111,11 @@ def parse_args():
         default="models",
         help="Directory to save model/checkpoint/loss curve.",
     )
+    parser.add_argument(
+        "--no-tqdm",
+        action="store_true",
+        help="Disable tqdm progress bar and use periodic text logging only.",
+    )
 
     return parser.parse_args()
 
@@ -133,7 +138,7 @@ def discover_cases(dataset_root: Path):
         parsed = _parse_case_dir(case_dir)
         if parsed is None:
             continue
-        dist_path = case_dir / "animation_data.npz"
+        dist_path = case_dir / "distribution_full.npz"
         if not dist_path.exists():
             continue
         T, k = parsed
@@ -350,6 +355,7 @@ def main():
         str(model_path),
         str(checkpoint_path),
         plt_fname=str(loss_plot_path),
+        use_tqdm=not args.no_tqdm,
     )
 
 

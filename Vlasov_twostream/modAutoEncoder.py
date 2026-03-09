@@ -12,6 +12,10 @@ import torch.nn.utils.prune as prune
 from torch.utils.data.dataloader import DataLoader
 import torch.utils.data as data_utils
 from torch.optim import lr_scheduler
+try:
+  from tqdm.auto import tqdm
+except Exception:
+  tqdm = None
 
 from scipy import sparse as sp
 from scipy import sparse
@@ -114,7 +118,8 @@ def trainAE( encoder,
              model_fname,
              chkpt_fname,
              plt_fname = 'training_loss.png',
-             num_epochs_save_model = 9999999 ):
+             num_epochs_save_model = 9999999,
+             use_tqdm = False ):
   model_dir = os.path.dirname(model_fname)
   if model_dir:
       os.makedirs(model_dir, exist_ok=True)
@@ -209,9 +214,25 @@ def trainAE( encoder,
           "Skipping additional training epochs.".format(last_epoch, num_epochs)
       )
   
-  for epoch in range(last_epoch+1,num_epochs+1):   
+  epoch_range = range(last_epoch+1,num_epochs+1)
+  progress_bar = None
+  if use_tqdm and tqdm is not None:
+      progress_bar = tqdm(epoch_range,
+                          total=max(0, num_epochs-last_epoch),
+                          desc='Training',
+                          unit='epoch',
+                          dynamic_ncols=True)
+      epoch_iter = progress_bar
+  else:
+      epoch_iter = epoch_range
+      if use_tqdm and tqdm is None:
+          print("tqdm is not available. Falling back to periodic text logging.")
+
+  show_periodic_logs = progress_bar is None
+
+  for epoch in epoch_iter:   
   
-      if epoch%num_epochs_print == 0:
+      if show_periodic_logs and epoch%num_epochs_print == 0:
           print()
           if scheduler !=None:
               print('Epoch {}/{}, Learning rate {}'.format(
@@ -288,9 +309,16 @@ def trainAE( encoder,
           if phase == 'train' and scheduler != None:
               scheduler.step(epoch_loss)
   
-          if epoch%num_epochs_print == 0:
+          if show_periodic_logs and epoch%num_epochs_print == 0:
               print('{} MSELoss: {}'.format(
                   phase, epoch_loss))
+
+      if progress_bar is not None:
+          progress_bar.set_postfix({
+              'lr': '{:.2e}'.format(optimizer.state_dict()['param_groups'][0]['lr']),
+              'train': '{:.3e}'.format(loss_hist['train'][-1]),
+              'test': '{:.3e}'.format(loss_hist['test'][-1]),
+          })
   
       # deep copy the model
       if loss_hist['test'][-1] < best_loss:
@@ -330,6 +358,9 @@ def trainAE( encoder,
           plt.semilogy(loss_hist['test'])
           plt.legend(['train','test'])
           plt.savefig(plt_fname)
+
+  if progress_bar is not None:
+      progress_bar.close()
   
   
   print()
