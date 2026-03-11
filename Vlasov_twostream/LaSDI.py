@@ -171,7 +171,7 @@ class LaSDI:
                 for iii in dist_index:
                     local.append(self.data_LS[iii])
                 model = ps.SINDy(feature_library = self.poly_library, optimizer = self.optimizer)    
-                model.fit(local, t = self.dt, multiple_trajectories = True, quiet = True)
+                model.fit(local, t = self.dt)
                 self.training_time = time.time()-training_time_start
                 latent_space_recon = self.normal*model.simulate(IC/self.normal, t)
                 FOM_recon = self.decoder(latent_space_recon)
